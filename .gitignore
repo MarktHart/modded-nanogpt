@@ -1,4 +1,13 @@
-fineweb10B/
-pylog124M/
+.DS_Store
+.idea
+.ipynb_checkpoints/
+.vscode
 __pycache__/
-logs/
+*.bin
+*.pkl
+*.pt
+*.pyc
+input.txt
+wandb
+env
+.env
