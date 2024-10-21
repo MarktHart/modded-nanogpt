@@ -23,12 +23,12 @@ def range_first_last(total):
 
 
 class AdamW(_AdamW):
-    def __init__(self, model, weight_decay, device, **kwargs) -> None:
+    def __init__(self, model, weight_decay, **kwargs) -> None:
         super().__init__(params=[
                 {"params": [p for p in model.parameters() if p.requires_grad and p.dim() >= 2], "weight_decay": weight_decay},
                 {"params": [p for p in model.parameters() if p.requires_grad and p.dim() < 2], "weight_decay": 0.0}
             ],
-            fused=device.type=="cuda",
+            fused=True,
             **kwargs,
         )
 

@@ -17,6 +17,13 @@ from utils import DistributedDataParallel, range_first_last, AdamW, CosineAnneal
 from transformer_engine.common import recipe
 import transformer_engine.pytorch as te
 
+# TODO bug in TE
+import logging
+logging.getLogger("DotProductAttention").setLevel(logging.WARNING)
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
+
 fp8_recipe = recipe.DelayedScaling() # margin=0, interval=1, fp8_format=recipe.Format.E4M3)
 
 # -----------------------------------------------------------------------------
@@ -104,7 +111,7 @@ class Hyperparameters:
     input_val_bin : str = '/data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 5100 # number of iterations to run
     learning_rate : float = 6e-4
@@ -159,9 +166,9 @@ model = torch.compile(model)
 # here we wrap model into DDP container
 model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
-ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-optimizer = AdamW(model=model, weight_decay=args.weight_decay, lr=args.learning_rate, betas=(0.9, 0.95), device=device)
+optimizer = AdamW(model=model, weight_decay=args.weight_decay, lr=args.learning_rate, betas=(0.9, 0.95))
 scheduler = CosineAnnealingWithWarmupLR(optimizer=optimizer, warmup_steps=args.warmup_iters, lr_decay_steps=args.num_iterations, min_lr=args.learning_rate / 10)
 
 # begin logging
@@ -190,7 +197,7 @@ torch.cuda.synchronize()
 t0 = time.time()
 # begin training
 train_loader.reset()
-for step in range(args.num_iterations + 1):
+for step in range(1, args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -207,16 +214,17 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
-            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss = model(x_val, y_val, return_logits=False)
-                val_loss += loss.detach()
-                del loss
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
+        with torch.no_grad(), torch.inference_mode():
+            val_loader.reset()
+            val_loss = 0.0
+            for _ in range(val_steps):
+                x_val, y_val = val_loader.next_batch()
+                with ctx:
+                    _, loss = model(x_val, y_val)
+                    val_loss += loss.detach()
+                    del loss
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
@@ -252,14 +260,15 @@ for step in range(args.num_iterations + 1):
         with model.no_sync_except_last(is_last=is_last):
             with ctx:
                 with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                    logits, loss = model(X, Y, is_first_microbatch=is_first)
+                    logits, loss = model(x, y, is_first_microbatch=is_first)
                     train_loss = loss.item()
-                    accumulated_loss = loss / train_accumulation_steps
-                    accumulated_loss.backward()
-            X, Y = train_loader.next_batch()
+                    loss = loss / train_accumulation_steps
+            loss.backward()
+            x, y = train_loader.next_batch()
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clipping)
 
+    optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
     # --------------- TRAINING SECTION END -------------------
@@ -268,14 +277,14 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         if step % 25 == 0:
+            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
             wandb.log({
                 "train/loss": train_loss,
                 "lr": scheduler.get_last_lr()[0],
             }, step=step)
-        with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            with open(logfile, "a") as f:
+                f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
