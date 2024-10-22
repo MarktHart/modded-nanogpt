@@ -141,12 +141,20 @@ assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
+VAL_SCALING = 4
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-model_args = TransformerModelConfig(model_class="LLAMA")
+val_loader = DistributedDataLoader(args.input_val_bin, B // VAL_SCALING, T, ddp_rank, ddp_world_size)
+model_args = TransformerModelConfig(
+    model_class="LLAMA",
+    n_layer = 6,
+    n_head = 12,
+    n_embd = 1536,
+)
+
+model = TransformerModel(config=model_args)
 
 if master_process:
-    wandb.init(project="modded-nanogpt", name=f"{model_args.model_class}-{int(time.time())}", config=asdict(args)|asdict(model_args))
+    wandb.init(project="modded-nanogpt", name=f"{model_args.model_class}-{int(round(model.get_num_params() / 1_000_000))}M-{int(time.time())}", config=asdict(args)|asdict(model_args))
     print("WandB initialized")
     print("Start training loop\n")
 
@@ -154,7 +162,6 @@ if master_process:
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
-model = TransformerModel(config=model_args)
 model = model.cuda()
 fp8_recipe = recipe.DelayedScaling()
 ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) #, cache_enabled=False)
@@ -175,9 +182,9 @@ scheduler = CosineAnnealingWithWarmupLR(optimizer=optimizer, warmup_steps=args.w
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
+    logdir = '/logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
+    logfile = '/logs/%s.txt' % run_id
     # create the log file
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
@@ -194,7 +201,7 @@ if master_process:
 
 training_time_ms = 0
 running_train_loss = 10.0
-running_train_loss_epsilon = 1./100.
+running_train_loss_epsilon = 1./10.
 
 
 # start the clock
@@ -222,15 +229,15 @@ for step in range(1, args.num_iterations + 1):
         with torch.no_grad(), torch.inference_mode():
             val_loader.reset()
             val_loss = 0.0
-            for is_first, is_last in range_with_first_and_last(val_steps):
+            for _ in range(val_steps * VAL_SCALING):
                 x_val, y_val = val_loader.next_batch()
                 with ctx:
                     with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                        _, loss = model(x_val, y_val, is_first_microbatch=is_first)
+                        _, loss = model(x_val, y_val, is_first_microbatch=True)
                         val_loss += loss.detach()
                         del loss
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss /= val_steps
+            val_loss /= (val_steps * VAL_SCALING)
         # log val loss to console and to logfile
         if master_process:
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')

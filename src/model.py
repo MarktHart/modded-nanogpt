@@ -86,6 +86,8 @@ class TransformerModel(nn.Module):
 
         if config.model_class != "GPT":
             del modules["wpe"]
+        else:
+            torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
 
         self.transformer = nn.ModuleDict(modules)
 
@@ -96,9 +98,6 @@ class TransformerModel(nn.Module):
             self.rope = None
 
         self.lm_head = te.Linear(config.n_embd, config.vocab_size, bias=False, init_method=lambda weight: torch.nn.init.normal_(weight, mean=0.0, std=0.02))
-
-        if config.model_class == "GPT":
-            torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
 
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
