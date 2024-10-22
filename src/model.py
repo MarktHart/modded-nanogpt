@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -87,7 +88,12 @@ class TransformerModel(nn.Module):
             del modules["wpe"]
 
         self.transformer = nn.ModuleDict(modules)
-        self.rope = None
+
+        if "LLAMA" in self.config.model_class:
+            self.register_buffer("rope", RotaryPositionEmbedding(self.config.n_embd//self.config.n_head)(max_seq_len=self.config.block_size), persistent=False)
+            # self.rope = RotaryPositionEmbeddingNonFused(self.config.n_embd//self.config.n_head)(max_seq_len=self.config.block_size)
+        else:
+            self.rope = None
 
         self.lm_head = te.Linear(config.n_embd, config.vocab_size, bias=False, init_method=lambda weight: torch.nn.init.normal_(weight, mean=0.0, std=0.02))
 
@@ -103,21 +109,18 @@ class TransformerModel(nn.Module):
             # n_params -= self.transformer.wte.weight.numel()
         return n_params
 
-    def forward(self, idx, targets=None, is_first_microbatch=None):
+    def forward(self, idx, targets, is_first_microbatch=None):
         device = idx.device
         b, t = idx.size()
 
         if self.config.model_class == "GPT":
             embeddings = self.transformer.wte(idx) + self.transformer.wpe(torch.arange(0, t, dtype=torch.long, device=device))
         else:
-            if self.rope is None:
-                with torch.cuda.amp.autocast(enabled=False):
-                    self.rope = RotaryPositionEmbedding(self.config.n_embd//self.config.n_head)(max_seq_len=self.config.block_size)
             embeddings = self.transformer.wte(idx)
 
         x = self.transformer.drop(embeddings)
         for block in self.transformer.h:
-            x = block(x, is_first_microbatch=is_first_microbatch, rotary_pos_emb=self.rope if "LLAMA" in self.config.model_class else None)
+            x = block(x, rotary_pos_emb=self.rope, is_first_microbatch=is_first_microbatch)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

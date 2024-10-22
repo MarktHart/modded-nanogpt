@@ -10,7 +10,7 @@ class DistributedDataParallel(_DistributedDataParallel):
         return nullcontext() if is_last else self.no_sync()
 
 
-def range_first_last(total):
+def range_with_first_and_last(total):
     if total == 0:
         return
     if total == 1:

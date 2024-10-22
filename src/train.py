@@ -13,18 +13,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from model import TransformerModelConfig, TransformerModel
-from utils import DistributedDataParallel, range_first_last, AdamW, CosineAnnealingWithWarmupLR, estimate_transformer_mfu
+from utils import DistributedDataParallel, range_with_first_and_last, AdamW, CosineAnnealingWithWarmupLR
 from transformer_engine.common import recipe
 import transformer_engine.pytorch as te
 
-# TODO bug in TE
+# TE things
 import logging
 logging.getLogger("DotProductAttention").setLevel(logging.WARNING)
-import torch._dynamo
-torch._dynamo.config.suppress_errors = True
-
-
-fp8_recipe = recipe.DelayedScaling() # margin=0, interval=1, fp8_format=recipe.Format.E4M3)
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -99,7 +94,7 @@ class DistributedDataLoader:
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        return x.cuda(non_blocking=True), y.cuda(non_blocking=True)
 
 # -----------------------------------------------------------------------------
 # int main
@@ -111,7 +106,7 @@ class Hyperparameters:
     input_val_bin : str = '/data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 32 # batch size, in sequences, per device
+    device_batch_size : int = 8 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 5100 # number of iterations to run
     learning_rate : float = 6e-4
@@ -161,12 +156,18 @@ x, y = train_loader.next_batch()
 
 model = TransformerModel(config=model_args)
 model = model.cuda()
-
+fp8_recipe = recipe.DelayedScaling()
+ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16, cache_enabled=False)
+with ctx:
+    te.make_graphed_callables(model, sample_args=(x, y), fp8_enabled=True, fp8_recipe=fp8_recipe, fp8_weight_caching=True)
+    model.eval()
+    te.make_graphed_callables(model, sample_args=(x, y), fp8_enabled=True, fp8_recipe=fp8_recipe, fp8_weight_caching=True)
+    model.train()
 model = torch.compile(model)
+
 # here we wrap model into DDP container
 model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
-ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 optimizer = AdamW(model=model, weight_decay=args.weight_decay, lr=args.learning_rate, betas=(0.9, 0.95))
 scheduler = CosineAnnealingWithWarmupLR(optimizer=optimizer, warmup_steps=args.warmup_iters, lr_decay_steps=args.num_iterations, min_lr=args.learning_rate / 10)
@@ -192,6 +193,10 @@ if master_process:
         f.write('='*100 + '\n')
 
 training_time_ms = 0
+running_train_loss = 10.0
+running_train_loss_epsilon = 1./100.
+
+
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -217,12 +222,13 @@ for step in range(1, args.num_iterations + 1):
         with torch.no_grad(), torch.inference_mode():
             val_loader.reset()
             val_loss = 0.0
-            for _ in range(val_steps):
+            for is_first, is_last in range_with_first_and_last(val_steps):
                 x_val, y_val = val_loader.next_batch()
                 with ctx:
-                    _, loss = model(x_val, y_val)
-                    val_loss += loss.detach()
-                    del loss
+                    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                        _, loss = model(x_val, y_val, is_first_microbatch=is_first)
+                        val_loss += loss.detach()
+                        del loss
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= val_steps
         # log val loss to console and to logfile
@@ -256,15 +262,14 @@ for step in range(1, args.num_iterations + 1):
         break
 
     # --------------- TRAINING SECTION BEGIN -----------------
-    for is_first, is_last in range_first_last(train_accumulation_steps):
+    for is_first, is_last in range_with_first_and_last(train_accumulation_steps):
         with model.no_sync_except_last(is_last=is_last):
             with ctx:
                 with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
                     logits, loss = model(x, y, is_first_microbatch=is_first)
-                    train_loss = loss.item()
                     loss = loss / train_accumulation_steps
-            loss.backward()
             x, y = train_loader.next_batch()
+            loss.backward()
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clipping)
 
@@ -274,21 +279,26 @@ for step in range(1, args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
+    train_loss = loss.item() * train_accumulation_steps
+    running_train_loss = (1 - running_train_loss_epsilon) * running_train_loss + running_train_loss_epsilon * train_loss
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
+        if step % 5 == 0:
+            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_loss_running:{running_train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         if step % 25 == 0:
-            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
             wandb.log({
                 "train/loss": train_loss,
+                "train/running_loss": running_train_loss,
                 "lr": scheduler.get_last_lr()[0],
             }, step=step)
             with open(logfile, "a") as f:
-                f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+                f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss:.4f} train_loss_running:{running_train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
 # -------------------------------------------------------------------------
 # clean up nice
+dist.barrier()
 dist.destroy_process_group()
